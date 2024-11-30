@@ -1,0 +1,21 @@
+{
+  "name": "@nemikolh/supabase-cli",
+  "version": "0.0.2",
+  "description": "Supabase CLI compiled to WASM for use in WebContainer",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Nemikolh/supabase-cli.git"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "bin": {
+    "supabase": "cli.js"
+  },
+  "keywords": [
+    "webcontainer",
+    "supabase",
+    "cli"
+  ]
+}

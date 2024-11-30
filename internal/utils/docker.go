@@ -3,55 +3,31 @@ package utils
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"os"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
 
 	podman "github.com/containers/common/libnetwork/types"
-	"github.com/docker/cli/cli/command"
-	"github.com/docker/cli/cli/compose/loader"
-	dockerConfig "github.com/docker/cli/cli/config"
-	dockerFlags "github.com/docker/cli/cli/flags"
-	"github.com/docker/cli/cli/streams"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
-	"github.com/docker/docker/api/types/image"
-	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/versions"
-	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/errdefs"
-	"github.com/docker/docker/pkg/jsonmessage"
 	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/go-errors/errors"
 	"github.com/spf13/viper"
-	"go.opentelemetry.io/otel"
 )
 
 var Docker = NewDocker()
 
 func NewDocker() *client.Client {
-	// TODO: refactor to initialize lazily
-	cli, err := command.NewDockerCli()
-	if err != nil {
-		log.Fatalln("Failed to create Docker client:", err)
-	}
-	// Silence otel errors as users don't care about docker metrics
-	// 2024/08/12 23:11:12 1 errors occurred detecting resource:
-	// 	* conflicting Schema URL: https://opentelemetry.io/schemas/1.21.0
-	otel.SetErrorHandler(otel.ErrorHandlerFunc(func(cause error) {}))
-	if err := cli.Initialize(&dockerFlags.ClientOptions{}); err != nil {
-		log.Fatalln("Failed to initialize Docker client:", err)
-	}
-	return cli.Client().(*client.Client)
+	// log.Fatalln("Failed to create Docker client:", nil)
+
+	return nil
 }
 
 const (
@@ -158,29 +134,8 @@ func CliProjectFilter(projectId string) filters.Args {
 	)
 }
 
-var (
-	// Only supports one registry per command invocation
-	registryAuth string
-	registryOnce sync.Once
-)
-
 func GetRegistryAuth() string {
-	registryOnce.Do(func() {
-		config := dockerConfig.LoadDefaultConfigFile(os.Stderr)
-		// Ref: https://docs.docker.com/engine/api/sdk/examples/#pull-an-image-with-authentication
-		auth, err := config.GetAuthConfig(GetRegistry())
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "Failed to load registry credentials:", err)
-			return
-		}
-		encoded, err := json.Marshal(auth)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "Failed to serialise auth config:", err)
-			return
-		}
-		registryAuth = base64.URLEncoding.EncodeToString(encoded)
-	})
-	return registryAuth
+	return ""
 }
 
 // Defaults to Supabase public ECR for faster image pull
@@ -206,17 +161,7 @@ func GetRegistryImageUrl(imageName string) string {
 }
 
 func DockerImagePull(ctx context.Context, imageTag string, w io.Writer) error {
-	out, err := Docker.ImagePull(ctx, imageTag, image.PullOptions{
-		RegistryAuth: GetRegistryAuth(),
-	})
-	if err != nil {
-		return errors.Errorf("failed to pull docker image: %w", err)
-	}
-	defer out.Close()
-	if err := jsonmessage.DisplayJSONMessagesToStream(out, streams.NewOut(w), nil); err != nil {
-		return errors.Errorf("failed to display json stream: %w", err)
-	}
-	return nil
+	return errors.Errorf("failed to pull docker image: %s", imageTag)
 }
 
 // Used by unit tests
@@ -250,83 +195,7 @@ func DockerPullImageIfNotCached(ctx context.Context, imageName string) error {
 var suggestDockerInstall = "Docker Desktop is a prerequisite for local development. Follow the official docs to install: https://docs.docker.com/desktop"
 
 func DockerStart(ctx context.Context, config container.Config, hostConfig container.HostConfig, networkingConfig network.NetworkingConfig, containerName string) (string, error) {
-	// Pull container image
-	if err := DockerPullImageIfNotCached(ctx, config.Image); err != nil {
-		if client.IsErrConnectionFailed(err) {
-			CmdSuggestion = suggestDockerInstall
-		}
-		return "", err
-	}
-	// Setup default config
-	config.Image = GetRegistryImageUrl(config.Image)
-	if config.Labels == nil {
-		config.Labels = make(map[string]string, 2)
-	}
-	config.Labels[CliProjectLabel] = Config.ProjectId
-	config.Labels[composeProjectLabel] = Config.ProjectId
-	// Configure container network
-	hostConfig.ExtraHosts = append(hostConfig.ExtraHosts, extraHosts...)
-	if networkId := viper.GetString("network-id"); len(networkId) > 0 {
-		hostConfig.NetworkMode = container.NetworkMode(networkId)
-	} else if len(hostConfig.NetworkMode) == 0 {
-		hostConfig.NetworkMode = container.NetworkMode(NetId)
-	}
-	if err := DockerNetworkCreateIfNotExists(ctx, hostConfig.NetworkMode, config.Labels); err != nil {
-		return "", err
-	}
-	// Configure container volumes
-	var binds, sources []string
-	for _, bind := range hostConfig.Binds {
-		spec, err := loader.ParseVolume(bind)
-		if err != nil {
-			return "", errors.Errorf("failed to parse docker volume: %w", err)
-		}
-		if spec.Type != string(mount.TypeVolume) {
-			binds = append(binds, bind)
-		} else if len(spec.Source) > 0 {
-			sources = append(sources, spec.Source)
-		}
-	}
-	// Skip named volume for BitBucket pipeline
-	if os.Getenv("BITBUCKET_CLONE_DIR") != "" {
-		hostConfig.Binds = binds
-		// Bitbucket doesn't allow for --security-opt option to be set
-		// https://support.atlassian.com/bitbucket-cloud/docs/run-docker-commands-in-bitbucket-pipelines/#Full-list-of-restricted-commands
-		hostConfig.SecurityOpt = nil
-	} else {
-		// Create named volumes with labels
-		for _, name := range sources {
-			if _, err := Docker.VolumeCreate(ctx, volume.CreateOptions{
-				Name:   name,
-				Labels: config.Labels,
-			}); err != nil {
-				return "", errors.Errorf("failed to create volume: %w", err)
-			}
-		}
-	}
-	// Create container from image
-	resp, err := Docker.ContainerCreate(ctx, &config, &hostConfig, &networkingConfig, nil, containerName)
-	if err != nil {
-		return "", errors.Errorf("failed to create docker container: %w", err)
-	}
-	// Run container in background
-	err = Docker.ContainerStart(ctx, resp.ID, container.StartOptions{})
-	if err != nil {
-		if hostPort := parsePortBindError(err); len(hostPort) > 0 {
-			CmdSuggestion = suggestDockerStop(ctx, hostPort)
-			prefix := "Or configure"
-			if len(CmdSuggestion) == 0 {
-				prefix = "Try configuring"
-			}
-			name := containerName
-			if endpoint, ok := networkingConfig.EndpointsConfig[NetId]; ok && len(endpoint.Aliases) > 0 {
-				name = endpoint.Aliases[0]
-			}
-			CmdSuggestion += fmt.Sprintf("\n%s a different %s port in %s", prefix, name, Bold(ConfigPath))
-		}
-		err = errors.Errorf("failed to start docker container: %w", err)
-	}
-	return resp.ID, err
+	return "", errors.Errorf("docker is not available in WebContainer")
 }
 
 func DockerRemove(containerId string) {
@@ -458,35 +327,4 @@ func DockerExecOnceWithStream(ctx context.Context, containerId, workdir string, 
 		err = errors.New("error executing command")
 	}
 	return err
-}
-
-var portErrorPattern = regexp.MustCompile("Bind for (.*) failed: port is already allocated")
-
-func parsePortBindError(err error) string {
-	matches := portErrorPattern.FindStringSubmatch(err.Error())
-	if len(matches) > 1 {
-		return matches[len(matches)-1]
-	}
-	return ""
-}
-
-func suggestDockerStop(ctx context.Context, hostPort string) string {
-	if containers, err := Docker.ContainerList(ctx, container.ListOptions{}); err == nil {
-		for _, c := range containers {
-			for _, p := range c.Ports {
-				if fmt.Sprintf("%s:%d", p.IP, p.PublicPort) == hostPort {
-					if project, ok := c.Labels[CliProjectLabel]; ok {
-						return "\nTry stopping the running project with " + Aqua("supabase stop --project-id "+project)
-					} else {
-						name := c.ID
-						if len(c.Names) > 0 {
-							name = c.Names[0]
-						}
-						return "\nTry stopping the running container with " + Aqua("docker stop "+name)
-					}
-				}
-			}
-		}
-	}
-	return ""
 }
